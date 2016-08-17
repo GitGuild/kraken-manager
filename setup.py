@@ -10,7 +10,7 @@ setup(
     name='kraken-manager',
     version='0.0.9',
     py_modules=['kraken_manager'],
-    url='https://bitbucket.org/gitguild/kraken-manager',
+    url='https://github.com/gitguild/kraken-manager',
     license='MIT',
     classifiers=classifiers,
     author='Ira Miller',

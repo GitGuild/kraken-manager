@@ -10,7 +10,6 @@ import json
 import time
 import urllib
 from ledger import Amount, Balance
-
 import requests
 from requests import Timeout
 from requests.exceptions import ReadTimeout
@@ -304,6 +303,7 @@ class Kraken(ExchangePluginBase):
     def get_open_orders(self, market=None):
         oorders = self.submit_private_request('OpenOrders', {'trades': 'True'})
         orders = []
+
         if 'result' in oorders and 'open' in oorders['result']:
             rawos = oorders['result']['open']
             for id, o in rawos.iteritems():

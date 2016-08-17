@@ -8,9 +8,9 @@ classifiers = [
 
 setup(
     name='kraken-manager',
-    version='0.0.1',
+    version='0.0.9',
     py_modules=['kraken_manager'],
-    url='https://bitbucket.org/deginner/kraken-manager',
+    url='https://github.com/gitguild/kraken-manager',
     license='MIT',
     classifiers=classifiers,
     author='Ira Miller',
@@ -19,7 +19,13 @@ setup(
     setup_requires=['pytest-runner'],
     install_requires=[
         'sqlalchemy>=1.0.9',
-        'trade_manager>=0.0.1'
+        'trade_manager>=0.0.3',
+        'tapp-config>=0.0.2',
+        'tappmq', 'requests',
     ],
-    tests_require=['pytest', 'pytest-cov']
+    tests_require=['pytest', 'pytest-cov'],
+    entry_points="""
+[console_scripts]
+krakenm = kraken_manager:main
+"""
 )

@@ -4,36 +4,28 @@ This module can be imported by trade_manager and used like a plugin.
 """
 import base64
 import datetime
+import hashlib
 import hmac
 import json
 import time
 import urllib
 from ledger import Amount, Balance
-
-import hashlib
 import requests
-from requests.exceptions import Timeout, ConnectionError
+from requests import Timeout
+from requests.exceptions import ReadTimeout
+from requests.packages.urllib3.connection import ConnectionError
 
-from trade_manager import CFG, em, wm, ses, ExchangeError, make_ledger
-from trade_manager.plugin import InternalExchangePlugin
-
-NAME = 'kraken'
-KEY = CFG.get('kraken', 'key')
+from sqlalchemy_models import jsonify2
+from trade_manager import em, wm
+from trade_manager.plugin import ExchangePluginBase, get_order_by_order_id, submit_order
 
 baseUrl = 'https://api.kraken.com'
 REQ_TIMEOUT = 10  # seconds
-LEDGER_PERIOD = 604800 * 12# 3 month
+
+FIAT_CURRENCIES = ['USD', 'EUR', 'GBP']
 
 
-def unadjust_currency(c):
-    if len(c) > 3 and c[0] in "XZ":
-        c = c[1:]
-    if c == "XBT":
-        c = "BTC"
-    return c
-
-
-class Kraken(InternalExchangePlugin):
+class Kraken(ExchangePluginBase):
     NAME = 'kraken'
     _user = None
 
@@ -53,314 +45,397 @@ class Kraken(InternalExchangePlugin):
             'API-Sign': sign
         }
         try:
-            response = json.loads(requests.post(baseUrl + path, data=data, headers=headers,
-                                                timeout=REQ_TIMEOUT).text)
-        except (ConnectionError, Timeout, ValueError) as e:
-            raise ExchangeError('kraken', '%s %s while sending %r to %s' % (type(e), e, params, path))
+            rawresp = requests.post(baseUrl + path, data=data, headers=headers, timeout=REQ_TIMEOUT)
+            response = rawresp.text
+        except (ConnectionError, ReadTimeout, Timeout) as e:
+            self.logger.exception('%s %s while sending %r to kraken %s' % (type(e), e, params, path))
+            if retry < 3:
+                return self.submit_private_request(method, params=params, retry=retry + 1)
+        if rawresp.status_code == 502 or rawresp.status_code == 520:
+            self.logger.exception('%s error while sending %r to kraken %s' % (rawresp.status_code, params, path))
+            if retry < 3:
+                return self.submit_private_request(method, params=params, retry=retry + 1)
+        try:
+            jresp = json.loads(response)
+        except ValueError as e:
+            self.logger.exception('%s %s while sending %r to kraken %s, response %s' % (type(e), e, params, path, response))
+            return
         if "Invalid nonce" in response and retry < 3:
             return self.submit_private_request(method, params=params, retry=retry + 1)
         else:
-            return response
+            return jresp
 
     @classmethod
     def submit_public_request(cls, method, params=None):
         path = '/0/public/%s' % method
         data = urllib.urlencode(params)
-        try:
-            return json.loads(requests.get(baseUrl + path + "?" + data, timeout=REQ_TIMEOUT).text)
-        except (ConnectionError, Timeout, ValueError) as e:
-            raise ExchangeError('btce', '%s %s while sending %r to %s' % (type(e), e, params, path))
+        return json.loads(requests.get(baseUrl + path + "?" + data, timeout=REQ_TIMEOUT).text)
 
     @classmethod
-    def format_pair(cls, pair):
+    def format_market(cls, market):
         """
-        The default pair symbol is an uppercase string consisting of the base currency 
-        on the left and the quote currency on the right, separated by an underscore.
-        
+        The default market symbol is an uppercase string consisting of the base commodity
+        on the left and the quote commodity on the right, separated by an underscore.
+
         If the data provided by the exchange does not match the default
         implementation, then this method must be re-implemented.
 
-        :return: a pair formated according to what bitcoin_exchanges expects.
+        :return: a market formated according to what bitcoin_exchanges expects.
         """
-        middle = int(len(pair) / 2)
-        half1 = unadjust_currency(pair[:middle].strip("_"))
-        half2 = unadjust_currency(pair[middle:].strip("_"))
+        middle = int(len(market) / 2)
+        half1 = cls.format_commodity(market[:middle].strip("_"))
+        half2 = cls.format_commodity(market[middle:].strip("_"))
         return "%s_%s" % (half1, half2)
 
     @classmethod
-    def unformat_pair(cls, pair):
+    def unformat_market(cls, market):
         """
-        Reverse format a pair to the format recognized by the exchange.
+        Reverse format a market to the format recognized by the exchange.
         If the data provided by the exchange does not match the default
         implementation, then this method must be re-implemented.
 
-        :return: a pair formated according to what kraken expects.
+        :return: a market formated according to what kraken expects.
         """
-        if pair[0] != 'X':
-            middle = int(len(pair) / 2)
-            half1 = pair[:middle].strip("_")
-            half2 = pair[middle:].strip("_")
-            #half1, half2 = pair.split("_")
-            if half1 == 'BTC':
-                half1 = 'XBT'
-            if half2 in ['BTC', 'XBT']:
-                half2 = 'XXBT'
+        if "_" in market or len(market) == 8:
+            middle = int(len(market) / 2)
+            half1 = cls.unformat_commodity(market[:middle].strip("_"))
+            half2 = cls.unformat_commodity(market[middle:].strip("_"))
+            market = half1 + half2
+        return market
+
+    @classmethod
+    def format_commodity(cls, c):
+        """
+        The default commodity symbol is an uppercase string of 3 or 4 letters.
+
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+        """
+        if len(c) > 3 and c[0] in "XZ":
+            c = c[1:]
+        if c == "XBT":
+            return "BTC"
+        return c
+
+    @classmethod
+    def unformat_commodity(cls, c):
+        """
+        Reverse format a commodity to the format recognized by the exchange.
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+        """
+        c = c.strip('_')
+        if len(c) == 4 and c[0] in "XY":
+            return c
+        elif len(c) == 3 and c[0] not in "XY":
+            if c == 'BTC':
+                c = 'XBT'
+            if c in FIAT_CURRENCIES:
+                return 'Z' + c
             else:
-                half2 = 'Z%s' % half2
-            pair = 'X%s%s' % (half1, half2)
-        return pair
+                return 'X' + c
+        return c
 
     @classmethod
-    def get_ticker(cls, pair='BTC_USD'):
-        sp = pair.split("_")
-        base = sp[0]
-        quote = sp[1]
-        pair = cls.unformat_pair(pair)
-        fullticker = cls.submit_public_request('Ticker', {'pair': pair})
-        ticker = fullticker['result'][pair]
-        return create_ticker(ask=ticker['a'][0], bid=ticker['b'][0],
-                             timestamp=time.time(), volume=ticker['v'][1],
-                             last=ticker['c'][0], high=ticker['h'][1],
-                             low=ticker['l'][1], currency=quote, vcurrency=base)
+    def sync_book(cls, market=None):
+        pass
 
-    @classmethod
-    def get_order_book(cls, pair='BTC_USD'):
-        pair = cls.unformat_pair(pair)
-        book = cls.submit_public_request('Depth', {'pair': pair})
-        return book['result'][pair]
+    def sync_ticker(self, market='BTC_USD'):
+        pair = self.unformat_market(market)
+        full_ticker = self.submit_public_request('Ticker', {'pair': pair})
+        ticker = full_ticker['result'][pair]
+        tick = em.Ticker(float(ticker['b'][0]),
+                         float(ticker['a'][0]),
+                         float(ticker['h'][1]),
+                         float(ticker['l'][1]),
+                         float(ticker['v'][1]),
+                         float(ticker['c'][0]),
+                         market, 'kraken')
+        jtick = jsonify2(tick, 'Ticker')
+        self.red.set('kraken_%s_ticker' % market, jtick)
+        return tick
 
-    @classmethod
-    def get_trades(cls, pair):
-        pair = cls.unformat_pair(pair)
-        return cls.submit_public_request('Trades', {'pair': pair})
-
-    @classmethod
-    def get_spread(cls, pair='BTC_USD'):
-        pair = cls.unformat_pair(pair)
-        return cls.submit_public_request('Spread', {'pair': pair})
-
-    # private methods
-    def cancel_order(self, oid, pair=None):
-        # TODO check pair?
-        if pair is not None:
-            pair = self.unformat_pair(pair)
-        resp = self.submit_private_request('CancelOrder', {'txid': oid})
-        if resp and 'result' in resp and 'count' in resp['result'] and resp['result']['count'] > 0:
-            return True
-        return False
-
-    def cancel_orders(self, pair=None, **kwargs):
-        orders = self.get_open_orders()
-        success = True
-        for o in orders:
-            # TODO check pair
-            resp = self.cancel_order(o.order_id)
-            if not resp:
-                success = False
-        return success
-
-    def create_order(self, amount, price, otype, pair='BTC_USD', **kwargs):
-        if BLOCK_ORDERS:
-            return "order blocked"
-        pair = self.unformat_pair(pair)
-        otype = 'buy' if otype == 'bid' else 'sell'
-        if isinstance(amount, Amount):
-            amount = str(amount.number())
-        elif not isinstance(amount, str):
-            amount = str(amount)
-        if isinstance(price, Amount):
-            price = str(price.number())
-        elif not isinstance(price, str):
-            price = str(price)
-        options = {'type': otype, 'volume': amount, 'price': price, 'pair': pair, 'ordertype': 'limit'}
-        options.update(kwargs)
-        resp = self.submit_private_request('AddOrder', options)
-        if 'error' in resp and len(resp['error']) > 0:
-            raise ExchangeError('kraken', 'unable to create order %r for reason %r' % (options, resp['error']))
-        elif 'result' in resp and 'txid' in resp['result'] and len(resp['result']['txid']) > 0:
-            return str(resp['result']['txid'][0])
-
-    def get_closed_orders(self):
-        return self.submit_private_request('ClosedOrders', {'trades': 'True'})
-
-    def get_balance(self, btype='total'):
-        tbal = self.get_total_balance()
+    def sync_balances(self):
+        tbal = self.submit_private_request('Balance')
         if 'result' in tbal:
             total = Balance()
             for cur in tbal['result']:
-                if cur == 'XXBT':
-                    total += Amount("{0} {1}".format(tbal['result']['XXBT'], 'BTC'))
-                elif cur == 'ZEUR':
-                    total += Amount("{0} {1}".format(tbal['result']['ZEUR'], 'EUR'))
-                elif cur == 'ZUSD':
-                    total += Amount("{0} {1}".format(tbal['result']['ZUSD'], 'USD'))
-                elif cur == 'XETH':
-                    total += Amount("{0} {1}".format(tbal['result']['XETH'], 'ETH'))
-                elif cur == 'XLTC':
-                    total += Amount("{0} {1}".format(tbal['result']['XLTC'], 'LTC'))
+                commodity = self.format_commodity(cur)
+                amount = Amount("{0} {1}".format(tbal['result'][cur], commodity))
+                total = total + amount
         else:
             total = Balance()
-
-        if btype == 'total':
-            return total
-
+        # self.logger.debug("total balance: %s" % total)
         available = Balance(total)
         oorders = self.get_open_orders()
         for o in oorders:
+            o.load_commodities()
             if o.side == 'bid':
-                available -= o.price * o.amount.number()
+                available = available - o.price * o.amount.number()
             else:
-                available -= o.amount
+                available = available - o.amount
 
-        if btype == 'available':
-            return available
+        # self.logger.debug("available balance: %s" % available)
+        bals = {}
+        for amount in total:
+            comm = str(amount.commodity)
+            bals[comm] = self.session.query(wm.Balance).filter(wm.Balance.user_id == self.manager_user.id) \
+                .filter(wm.Balance.currency == comm).one_or_none()
+            if not bals[comm]:
+                bals[comm] = wm.Balance(amount, available.commodity_amount(amount.commodity), comm, "",
+                                        self.manager_user.id)
+                self.session.add(bals[comm])
+            else:
+                bals[comm].load_commodities()
+                bals[comm].total = amount
+                bals[comm].available = available.commodity_amount(amount.commodity)
+        try:
+            self.session.commit()
+        except Exception as e:
+            self.logger.exception(e)
+            self.session.rollback()
+            self.session.flush()
+
+    def sync_orders(self):
+        orders = self.submit_private_request('ClosedOrders', {'trades': 'False'})
+        if 'result' in orders and 'closed' in orders['result']:
+            rawos = orders['result']['closed']
+            for id, o in rawos.iteritems():
+                side = 'ask' if o['descr']['type'] == 'sell' else 'bid'
+                base = self.base_commodity(o['descr']['pair'])
+                quote = self.quote_commodity(o['descr']['pair'])
+                amount = Amount("%s %s" % (o['vol'], base)) - Amount("%s %s" % (o['vol_exec'], base))
+                lo = get_order_by_order_id(id, 'kraken', session=self.session)
+                # TODO update state and exec amount
+                if lo is None:
+                    lo = em.LimitOrder(Amount("%s %s" % (o['price'], quote)), amount,
+                                       self.format_market(o['descr']['pair']), side, 'kraken',
+                                       state='closed', order_id='kraken|%s' % id)
+                    self.session.add(lo)
+            try:
+                self.session.commit()
+            except Exception as e:
+                self.logger.exception(e)
+                self.session.rollback()
+                self.session.flush()
+        return orders
+
+    @classmethod
+    def get_order_book(cls, market='BTC_USD'):
+        market = cls.unformat_market(market)
+        book = cls.submit_public_request('Depth', {'pair': market})
+        return book['result'][market]
+
+    # private methods
+    def cancel_order(self, oid=None, order_id=None, order=None):
+        if order is None and oid is not None:
+            order = self.session.query(em.LimitOrder).filter(em.LimitOrder.id == oid).first()
+        elif order is None and order_id is not None:
+            order = self.session.query(em.LimitOrder).filter(em.LimitOrder.order_id == order_id).first()
+        elif order is None:
+            return
+        resp = self.submit_private_request('CancelOrder', {'txid': order.order_id.split("|")[1]})
+        if resp and 'result' in resp and 'count' in resp['result'] and resp['result']['count'] > 0:
+            order.state = 'closed'
+            order.order_id = order.order_id.replace('tmp', 'kraken')
+            try:
+                self.session.commit()
+            except Exception as e:
+                self.logger.exception(e)
+                self.session.rollback()
+                self.session.flush()
+
+    def cancel_orders(self, oid=None, order_id=None, market=None, side=None, price=None):
+        if oid is not None or order_id is not None:
+            order = self.session.query(em.LimitOrder)
+            if oid is not None:
+                order = order.filter(em.LimitOrder.id == oid).first()
+            elif order_id is not None:
+                order_id = order_id if "|" not in order_id else "kraken|%s" % order_id.split("|")[1]
+                order = get_order_by_order_id(order_id, 'kraken', session=self.session)
+            self.cancel_order(order=order)
         else:
-            return total, available
+            orders = self.get_open_orders(market=market)
+            for o in orders:
+                if market is not None and market != o.market:
+                    continue
+                if side is not None and side != o.side:
+                    continue
+                if price is not None:
+                    if o.side == 'bid' and o.price < price:
+                        continue
+                    elif o.side == 'ask' and o.price > price:
+                        continue
+                self.cancel_order(order=o)
 
-    def get_balance_by_asset(self):
-        return self.submit_private_request('Balance')
+    def create_order(self, oid, expire=None):
+        order = self.session.query(em.LimitOrder).filter(em.LimitOrder.id == oid).first()
+        if not order:
+            self.logger.warning("unable to find order %s" % oid)
+            if expire is not None and expire < time.time():
+                submit_order('kraken', oid, expire=expire)  # back of the line!
+            return
+        market = self.unformat_market(order.market)
+        amount = str(order.amount.number()) if isinstance(order.amount, Amount) else str(order.amount)
+        price = str(order.price.number()) if isinstance(order.price, Amount) else str(order.price)
+        side = 'buy' if order.side == 'bid' else 'sell'
+        options = {'type': side, 'volume': amount, 'price': price, 'pair': market, 'ordertype': 'limit'}
+        resp = None
+        try:
+            resp = self.submit_private_request('AddOrder', options)
+        except Exception as e:
+            self.logger.exception(e)
+        if resp is None or 'error' in resp and len(resp['error']) > 0:
+            self.logger.warning('kraken unable to create order %r for reason %r' % (options, resp))
+            # Do nothing. The order can stay locally "pending" and be retried, if desired.
+        elif 'result' in resp and 'txid' in resp['result'] and len(resp['result']['txid']) > 0:
+            order.order_id = 'kraken|%s' % resp['result']['txid'][0]
+            order.state = 'open'
+            self.logger.debug("submitted order %s" % order)
+            try:
+                self.session.commit()
+            except Exception as e:
+                self.logger.exception(e)
+                self.session.rollback()
+                self.session.flush()
+            return order
 
-    def get_total_balance(self):
-        return self.submit_private_request('Balance')
-
-    def get_open_orders(self, pair=None):
+    def get_open_orders(self, market=None):
         oorders = self.submit_private_request('OpenOrders', {'trades': 'True'})
         orders = []
-        if pair is not None:
-             pair = self.unformat_pair(pair)
+
         if 'result' in oorders and 'open' in oorders['result']:
             rawos = oorders['result']['open']
             for id, o in rawos.iteritems():
                 side = 'ask' if o['descr']['type'] == 'sell' else 'bid'
-                base = unadjust_currency(o['descr']['pair'][:3])
+                pair = self.format_market(o['descr']['pair'])
+                base = self.base_commodity(pair)
                 amount = Amount("%s %s" % (o['vol'], base)) - Amount("%s %s" % (o['vol_exec'], base))
-                quote = unadjust_currency(o['descr']['pair'][3:])
-                if pair is None or self.unformat_pair(o['descr']['pair']) == pair:
-                    orders.append(MyOrder(Amount("%s %s" % (o['descr']['price'], quote)), amount, side, self.NAME, str(id)))
+                quote = self.quote_commodity(pair)
+                if market is None or pair == self.format_market(market):
+                    try:
+                        lo = get_order_by_order_id(id, 'kraken', session=self.session)
+                    except Exception as e:
+                        self.logger.exception(e)
+                    if lo is None:
+                        lo = em.LimitOrder(Amount("%s %s" % (o['descr']['price'], quote)), amount, pair, side,
+                                           self.NAME, str(id), exec_amount=Amount("0 %s" % base), state='open')
+                        self.session.add(lo)
+                    else:
+                        lo.state = 'open'
+                    orders.append(lo)
+        try:
+            self.session.commit()
+        except Exception as e:
+            self.logger.exception(e)
+            self.session.rollback()
+            self.session.flush()
         return orders
 
-    def get_deposit_address(self, method='Bitcoin', asset='BTC'):
-        addys = self.submit_private_request('DepositAddresses', 
-                {'asset': asset, 'method':method})
-        if len(addys['error']) > 0:
-            raise ExchangeError('kraken', addys['error'])
-        for addy in addys['result']:
-            if int(addy['expiretm']) < time.time() + 1440:
-                return str(addy['address'])
-        raise ExchangeError('kraken', "unable to get deposit address")
-
-    def get_trades_history(self, begin='last', end=None, pair=None, offset=None):
-        # TODO pair is ignored... filter for pair
-        params = {'trades': 'True'}
-        if begin == 'last':
-            last = ses.query(em.Trade)\
-                        .filter(em.Trade.exchange=='kraken')\
-                        .order_by(em.Trade.time.desc())\
-                        .first()
-            params['start'] = str(time.mktime(last.time.timetuple()))
-        elif begin is not None:
+    def get_trades_history(self, begin=None, tend=None, market=None, offset=None):
+        # TODO market is ignored... filter for market
+        params = {}
+        if begin is not None:
             params['start'] = str(begin)
-        if end is not None:
-            params['end'] = str(end)
+        if tend is not None:
+            params['end'] = str(tend)
         if offset is not None:
             params['ofs'] = str(offset)
         return self.submit_private_request('TradesHistory', params)
 
-    def save_trades(self, begin='last', end=None, pair=None):
+    def sync_trades(self, market=None, rescan=False):
         offset = 0
         lastoffset = -1
         lastsleep = 4
         trades = None
+        changed = False
         while offset != lastoffset:
+            self.logger.debug("begin offset\t%s\nlastoffset\t%s" % (offset, lastoffset))
             try:
-                trades = self.get_trades_history(begin, end, pair, offset)
-            except ExchangeError as e:
+                trades = self.get_trades_history(market=market, offset=offset)
+            except (IOError, ValueError) as e:
                 if "ReadTimeout" in str(e):
                     lastsleep *= 2
                     time.sleep(lastsleep)
                     continue
+                return
             if not trades or 'result' not in trades or trades['result']['count'] == 0:
-                print "; non-interesting trades %s" % trades
+                self.logger.debug("; non-interesting trades %s" % trades)
                 if "error" in trades and len(trades['error']) > 0 and \
                         "Rate limit exceeded" in trades['error'][0]:
                     lastsleep *= 1.5
                     time.sleep(lastsleep)
+                    continue
                 elif "error" in trades and len(trades['error']) > 0 and \
                         "Invalid nonce" in trades['error'][0]:
                     time.sleep(30)
-                continue
+                    continue
+                return
             if lastsleep > 1:
                 lastsleep *= 0.975
             lastoffset = offset
             for tid in trades['result']['trades']:
                 lastoffset = offset
-                offset += 1
-                found = ses.query(em.Trade)\
-                        .filter(em.Trade.trade_id=='kraken|%s' % tid)\
-                        .count()
+                if rescan:
+                    offset += 1
+                found = self.session.query(em.Trade) \
+                    .filter(em.Trade.trade_id == 'kraken|%s' % tid) \
+                    .count()
                 if found != 0:
-                    print "; %s already known" % tid
+                    self.logger.debug("%s already known" % tid)
                     continue
                 row = trades['result']['trades'][tid]
                 dtime = datetime.datetime.fromtimestamp(float(row['time']))
-                market = self.format_pair(row['pair'])
+                market = self.format_market(row['pair'])
                 price = float(row['price'])
                 amount = float(row['vol'])
                 fee = float(row['fee'])
                 side = row['type']
-                ses.add(em.Trade(tid, 'kraken', market, side,
-                        amount, price, fee, 'quote', dtime))
-            ses.commit()
+                trade = em.Trade(tid, 'kraken', market, side, amount, price, fee, 'quote', dtime)
+                self.session.add(trade)
+                changed = True
+                self.logger.debug("end offset\t%s\nlastoffset\t%s" % (offset, lastoffset))
+        if changed:
+            self.session.commit()
 
-    def get_ledgers(self, ltype='all', begin=None, end=None, ofs=None):
+    def get_ledgers(self, ltype='all', begin=None, tend=None, ofs=None):
         params = {'type': ltype}
-        if begin == 'last':
-            if ltype == 'deposit' or ltype == 'all':
-                lastcred = ses.query(wm.Credit)\
-                            .filter(wm.Credit.reference=='kraken')\
-                            .order_by(wm.Credit.time.desc()).first()
-                if lastcred:
-                    params['start'] = str(int(time.mktime(lastcred.time.timetuple())) - 1)
-            if ltype == 'withdrawal' or ltype == 'all':
-                lastdeb = ses.query(wm.Debit)\
-                            .filter(wm.Debit.reference=='kraken')\
-                            .order_by(wm.Debit.time.desc())\
-                            .first()
-                if lastdeb is not None:
-                    timmy = int(time.mktime(lastdeb.time.timetuple()))
-                    if 'start' not in params or int(params['start']) > timmy:
-                        params['start'] = str(timmy - 1)                
-        elif begin is not None:
+        if begin is not None:
             params['start'] = str(begin)
-        if end is not None:
-            params['end'] = str(end)
+        if tend is not None:
+            params['end'] = str(tend)
         if ofs is not None:
             params['ofs'] = str(ofs)
         return self.submit_private_request('Ledgers', params)
 
-    def save_credits(self, begin='last', end=None):
+    def sync_credits(self, rescan=False):
         offset = 0
         lastoffset = -1
         lastsleep = 2
-        ledgers = None
+        changed = False
         while offset != lastoffset:
+            ledgers = None
+            self.logger.debug("begin offset\t%s\nlastoffset\t%s" % (offset, lastoffset))
             try:
-                ledgers = self.get_ledgers(ofs=offset, begin=begin,
-                                           end=end, ltype='deposit')
-            except ExchangeError as e:
+                ledgers = self.get_ledgers(ofs=offset, ltype='deposit')
+            except (IOError, ValueError) as e:
+                self.logger.exception(e)
                 if "ReadTimeout" in str(e):
                     lastsleep *= 2
                     time.sleep(lastsleep)
-                    return
+                    continue
+                return
             if not ledgers or 'result' not in ledgers or ledgers['result']['count'] == 0:
-                print "non-interesting ledgers %s" % ledgers
+                self.logger.warning(ledgers)
                 if "error" in ledgers and len(ledgers['error']) > 0 and \
-                        "Rate limit exceeded" in ledgers['error'][0]:
+                                "Rate limit exceeded" in ledgers['error'][0]:
                     lastsleep *= 1.5
                     time.sleep(lastsleep)
+                    continue
                 elif "error" in ledgers and len(ledgers['error']) > 0 and \
-                        "Invalid nonce" in ledgers['error'][0]:
+                                "Invalid nonce" in ledgers['error'][0]:
                     time.sleep(30)
+                    continue
                 return
             if lastsleep > 1:
                 lastsleep *= 0.95
@@ -368,36 +443,42 @@ class Kraken(InternalExchangePlugin):
             for bid in ledgers['result']['ledger']:
                 row = ledgers['result']['ledger'][bid]
                 lastoffset = offset
-                offset += 1
-                found = ses.query(wm.Credit)\
-                        .filter(wm.Credit.ref_id=='kraken|%s' % bid)\
-                        .count()
+                if rescan:
+                    offset += 1
+                found = self.session.query(wm.Credit) \
+                    .filter(wm.Credit.ref_id == 'kraken|%s' % bid) \
+                    .count()
                 if found != 0:
-                    print "%s already known" % bid
+                    self.logger.debug("%s already known" % bid)
                     continue
                 dtime = datetime.datetime.fromtimestamp(float(row['time']))
-                asset = unadjust_currency(row['asset'])
+                asset = self.format_commodity(row['asset'])
                 amount = Amount("%s %s" % (row['amount'], asset))
                 refid = row['refid']
-                ses.add(wm.Credit(amount, refid, asset, "kraken", "complete", "kraken", "kraken|%s" % bid, self.get_manager_user().id, dtime))
-            ses.commit()
+                cred = wm.Credit(amount, refid, asset, "kraken", "complete", "kraken", "kraken|%s" % bid,
+                                 self.manager_user.id, dtime)
+                self.session.add(cred)
+                changed = True
+                self.logger.debug("end offset\t%s\nlastoffset\t%s" % (offset, lastoffset))
+        if changed:
+            self.session.commit()
 
-    def save_debits(self, begin='last', end=None):
+    def sync_debits(self, rescan=False):
         offset = 0
         lastoffset = -1
         lastsleep = 2
         ledgers = None
+        changed = True
         while offset != lastoffset:
             try:
-                ledgers = self.get_ledgers(ofs=offset, begin=begin,
-                                           end=end, ltype='withdrawal')
-            except ExchangeError as e:
+                ledgers = self.get_ledgers(ofs=offset, ltype='withdrawal')
+            except (IOError, ValueError) as e:
                 if "ReadTimeout" in str(e):
                     lastsleep *= 2
                     time.sleep(lastsleep)
-                    return
+                    continue
             if not ledgers or 'result' not in ledgers or ledgers['result']['count'] == 0:
-                print "; non-interesting ledgers %s" % ledgers
+                self.logger.debug("; non-interesting ledgers %s" % ledgers)
                 if "error" in ledgers and len(ledgers['error']) > 0 and \
                         "Rate limit exceeded" in ledgers['error'][0]:
                     lastsleep *= 2
@@ -405,52 +486,38 @@ class Kraken(InternalExchangePlugin):
                 elif "error" in ledgers and len(ledgers['error']) > 0 and \
                         "Invalid nonce" in ledgers['error'][0]:
                     time.sleep(30)
-                return
+                continue
             if lastsleep > 1:
                 lastsleep -= 1
             lastoffset = offset
             for bid in ledgers['result']['ledger']:
                 lastoffset = offset
-                offset += 1
-                found = ses.query(wm.Debit)\
-                        .filter(wm.Debit.ref_id=='kraken|%s' % bid)\
-                        .count()
+                if rescan:
+                    offset += 1
+                found = self.session.query(wm.Debit) \
+                    .filter(wm.Debit.ref_id == 'kraken|%s' % bid) \
+                    .count()
                 if found != 0:
-                    print "; %s already known" % bid
+                    self.logger.debug("; %s already known" % bid)
                     continue
                 row = ledgers['result']['ledger'][bid]
                 dtime = datetime.datetime.fromtimestamp(float(row['time']))
-                asset = unadjust_currency(row['asset'])
+                asset = self.format_commodity(row['asset'])
                 amount = Amount("%s %s" % (row['amount'], asset))
                 fee = Amount("%s %s" % (row['fee'], asset))
                 refid = row['refid']
-                ses.add(wm.Debit(amount, fee, refid, asset, "kraken", "complete", "kraken", "kraken|%s" % bid, self.get_manager_user().id, dtime))
-            ses.commit()
+                self.session.add(wm.Debit(amount, fee, refid, asset, "kraken", "complete", "kraken", "kraken|%s" % bid,
+                                          self.manager_user.id, dtime))
+                changed = True
+                self.logger.debug("end offset\t%s\nlastoffset\t%s" % (offset, lastoffset))
+        if changed:
+            self.session.commit()
 
-    """
-    The remaining methods are unused, but supported by Kraken.
-    """
-    @classmethod
-    def get_time(cls):
-        return cls.submit_public_request('Time')
 
-    @classmethod
-    def get_info(cls):
-        return cls.submit_public_request('Assets')
-
-    @classmethod
-    def get_pairs(cls):
-        return cls.submit_public_request('AssetPairs')
-
-    @classmethod
-    def get_ohlc(cls, pair):
-        return cls.submit_public_request(method='OHLC', params={'pair': pair})
+def main():
+    kraken = Kraken()
+    kraken.run()
 
 
 if __name__ == "__main__":
-    kraken = Kraken()
-    kraken.save_trades()
-    kraken.save_credits()
-    kraken.save_debits()
-    ledger = make_ledger(exchange='kraken')
-    print ledger
+    main()
